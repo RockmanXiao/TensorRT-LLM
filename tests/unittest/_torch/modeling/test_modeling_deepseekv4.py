@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import ast
 import inspect
 import json
@@ -30,6 +33,7 @@ from tensorrt_llm._torch.models.modeling_deepseekv4 import (
     DeepseekV4DecoderLayer,
     DeepseekV4ForCausalLM,
     DeepseekV4Gate,
+    DeepseekV4MoE,
     DeepseekV4MTP,
     _copy_deepseek_v4_fused_a_weight_scale,
     _deepseek_v4_pos_embd_params,
@@ -442,6 +446,34 @@ def test_deepseek_v4_moe_auto_backend_on_blackwell(monkeypatch):
     assert ModelConfig.resolve_moe_backend("AUTO", "DeepseekV4ForCausalLM") == "TRTLLM"
 
 
+def test_deepseek_v4_mixed_default_resolves_from_fp8_headers(tmp_path):
+    _write_safetensors_header(
+        tmp_path / "weight.safetensors", "layers.0.attn.wq_a.weight", "F8_E4M3", [128, 128]
+    )
+    _write_safetensors_header(
+        tmp_path / "scale.safetensors", "layers.0.attn.wq_a.scale", "F8_E8M0", [1, 1]
+    )
+    quant_config = QuantConfig(
+        quant_algo=QuantAlgo.MIXED_PRECISION,
+        kv_cache_quant_algo=QuantAlgo.FP8,
+        group_size=16,
+        exclude_modules=["*.attn.*", "*.ffn.shared_experts.*", "head", "mtp.*"],
+    )
+
+    resolved = ModelConfig._resolve_deepseek_v4_mixed_quant_config(str(tmp_path), quant_config)
+
+    assert resolved is quant_config
+    assert resolved.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+    assert resolved.kv_cache_quant_algo == QuantAlgo.FP8
+    assert resolved.group_size == 128
+    assert resolved.exclude_modules == [
+        "*kv_b_proj*",
+        "*k_b_proj*",
+        "*eh_proj",
+        "lm_head",
+    ]
+
+
 def test_deepseek_v4_routed_moe_quant_config_from_mxfp4_header(tmp_path, monkeypatch):
     monkeypatch.setattr("tensorrt_llm._torch.model_config.get_sm_version", lambda: 100)
     tensor_name = "layers.0.ffn.experts.0.w1.weight"
@@ -507,6 +539,105 @@ def test_deepseek_v4_routed_moe_quant_config_covers_mtp_layers(tmp_path, monkeyp
     quant_algo = layer_quant_config["model.layers.0.mlp.experts"].quant_algo
     for layer_idx in range(1, 5):
         assert layer_quant_config[f"model.layers.{layer_idx}.mlp.experts"].quant_algo == quant_algo
+
+
+def test_deepseek_v4_routed_moe_quant_config_detects_mtp_mxfp4(tmp_path, monkeypatch):
+    monkeypatch.setattr("tensorrt_llm._torch.model_config.get_sm_version", lambda: 100)
+    _write_safetensors_header(
+        tmp_path / "base.safetensors",
+        "layers.0.ffn.experts.0.w1.weight",
+        "U8",
+        [2, 2],
+    )
+    _write_safetensors_header(
+        tmp_path / "mtp.safetensors",
+        "mtp.0.ffn.experts.0.w1.weight",
+        "I8",
+        [2, 2],
+    )
+
+    class MTPMode:
+        @staticmethod
+        def is_mtp_one_model():
+            return True
+
+    class MTPConfig:
+        spec_dec_mode = MTPMode()
+        num_nextn_predict_layers = 3
+
+    config = DeepseekV4Config(num_hidden_layers=2, num_nextn_predict_layers=1)
+    layer_quant_config = ModelConfig._set_deepseek_v4_routed_moe_quant_config(
+        config, str(tmp_path), "TRTLLM", None, MTPConfig()
+    )
+
+    assert layer_quant_config["model.layers.0.mlp.experts"].quant_algo == QuantAlgo.NVFP4
+    for layer_idx in range(2, 5):
+        mtp_quant_config = layer_quant_config[f"model.layers.{layer_idx}.mlp.experts"]
+        assert mtp_quant_config.quant_algo == QuantAlgo.W4A8_MXFP4_MXFP8
+        assert mtp_quant_config.group_size == 32
+
+
+def test_deepseek_v4_concrete_mixed_quant_config_resolution():
+    config = DeepseekV4Config(num_hidden_layers=2, num_nextn_predict_layers=1)
+    global_quant_config = QuantConfig(
+        quant_algo=QuantAlgo.FP8_BLOCK_SCALES,
+        kv_cache_quant_algo=QuantAlgo.FP8,
+        group_size=128,
+        exclude_modules=["*kv_b_proj*", "*k_b_proj*", "*eh_proj", "lm_head"],
+    )
+    experts_quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16)
+    mtp_experts_quant_config = QuantConfig(quant_algo=QuantAlgo.W4A8_MXFP4_MXFP8, group_size=32)
+    model_config = ModelConfig(
+        pretrained_config=config,
+        quant_config=global_quant_config,
+        quant_config_dict={
+            "model.layers.0.mlp.experts": experts_quant_config,
+            "model.layers.2.mlp.experts": mtp_experts_quant_config,
+        },
+    )
+
+    decoder_quant_config = DeepseekV4DecoderLayer._get_decoder_layer_quant_config(model_config, 0)
+    shared_quant_config = DeepseekV4MoE._get_shared_experts_quant_config(model_config, 0)
+    routed_quant_config = DeepseekV4MoE._get_experts_quant_config(model_config, 0)
+    mtp_routed_quant_config = DeepseekV4MoE._get_experts_quant_config(model_config, 2)
+
+    assert decoder_quant_config is global_quant_config
+    assert decoder_quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+    assert decoder_quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+    assert decoder_quant_config.group_size == 128
+    assert shared_quant_config is global_quant_config
+    assert shared_quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+    assert shared_quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+    assert shared_quant_config.group_size == 128
+    assert routed_quant_config is experts_quant_config
+    assert mtp_routed_quant_config is mtp_experts_quant_config
+
+
+def test_deepseek_v4_unresolved_mixed_precision_is_rejected():
+    model_config = ModelConfig(
+        pretrained_config=DeepseekV4Config(num_hidden_layers=2),
+        quant_config=QuantConfig(quant_algo=QuantAlgo.MIXED_PRECISION),
+    )
+
+    with pytest.raises(ValueError, match="concrete algorithm"):
+        DeepseekV4DecoderLayer._get_decoder_layer_quant_config(model_config, 0)
+    with pytest.raises(ValueError, match="concrete algorithm"):
+        DeepseekV4MoE._get_shared_experts_quant_config(model_config, 0)
+    with pytest.raises(ValueError, match="Missing concrete routed-expert"):
+        DeepseekV4MoE._get_experts_quant_config(model_config, 0)
+
+
+def test_deepseek_v4_uniform_quant_config_resolution_is_unchanged():
+    config = DeepseekV4Config(num_hidden_layers=2)
+    global_quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16)
+    model_config = ModelConfig(pretrained_config=config, quant_config=global_quant_config)
+
+    assert (
+        DeepseekV4DecoderLayer._get_decoder_layer_quant_config(model_config, 0)
+        is global_quant_config
+    )
+    assert DeepseekV4MoE._get_experts_quant_config(model_config, 0) is global_quant_config
+    assert DeepseekV4MoE._get_shared_experts_quant_config(model_config, 0) is global_quant_config
 
 
 def test_deepseek_v4_mtp_projection_uses_fp8_quant_config(monkeypatch):

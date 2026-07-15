@@ -59,6 +59,8 @@ TConfig = TypeVar("TConfig", bound=transformers.PretrainedConfig)
 
 _DEEPSEEK_V4_ARCHITECTURES = {"DeepseekV4ForCausalLM"}
 _DEEPSEEK_V4_ROUTED_EXPERT_WEIGHT = "layers.0.ffn.experts.0.w1.weight"
+_DEEPSEEK_V4_DEFAULT_LINEAR_WEIGHT = "layers.0.attn.wq_a.weight"
+_DEEPSEEK_V4_DEFAULT_LINEAR_SCALE = "layers.0.attn.wq_a.scale"
 
 _MINIMAX_M3_ARCHITECTURES = {
     "MiniMaxM3SparseForCausalLM",
@@ -599,6 +601,39 @@ class ModelConfig(Generic[TConfig]):
         return None
 
     @staticmethod
+    def _resolve_deepseek_v4_mixed_quant_config(
+            checkpoint_dir: str, quant_config: QuantConfig) -> QuantConfig:
+        """Resolve the concrete default algorithm for a DSV4 mixed checkpoint.
+
+        DSV4's ModelOpt metadata uses ``MIXED_PRECISION`` as a container and
+        only lists the routed-expert overrides. The remaining transformer
+        linears are stored as FP8 block-scaled tensors, so infer that default
+        from the weight and scale headers instead of treating MIXED_PRECISION
+        as an executable quantization algorithm.
+        """
+        if quant_config.quant_algo != QuantAlgo.MIXED_PRECISION:
+            return quant_config
+
+        weight_info = ModelConfig._get_safetensors_header_for_tensor(
+            checkpoint_dir, _DEEPSEEK_V4_DEFAULT_LINEAR_WEIGHT)
+        scale_info = ModelConfig._get_safetensors_header_for_tensor(
+            checkpoint_dir, _DEEPSEEK_V4_DEFAULT_LINEAR_SCALE)
+        if (weight_info is None or scale_info is None
+                or weight_info.get("dtype") != "F8_E4M3"
+                or scale_info.get("dtype") != "F8_E8M0"):
+            return quant_config
+
+        quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
+        quant_config.group_size = 128
+        quant_config.exclude_modules = [
+            "*kv_b_proj*", "*k_b_proj*", "*eh_proj", "lm_head"
+        ]
+        logger.info(
+            "Detected DeepSeek-V4 FP8 block-scaled default linear layout; "
+            "using FP8_BLOCK_SCALES outside routed experts.")
+        return quant_config
+
+    @staticmethod
     def _is_deepseek_v4_base_checkpoint(checkpoint_dir: str) -> bool:
         tensor_info = ModelConfig._get_safetensors_header_for_tensor(
             checkpoint_dir, _DEEPSEEK_V4_ROUTED_EXPERT_WEIGHT)
@@ -637,32 +672,54 @@ class ModelConfig(Generic[TConfig]):
                     "for MXFP4 or U8 for NVFP4.")
             return layer_quant_config
 
-        experts_quant_config = QuantConfig()
-        if layout == "mxfp4":
-            experts_quant_config.quant_algo = ModelConfig.get_mxfp4_quant_algo(
-                moe_backend)
-            experts_quant_config.group_size = 32
-        else:
-            experts_quant_config.quant_algo = QuantAlgo.NVFP4
-            experts_quant_config.group_size = 16
-        experts_quant_config.exclude_modules = [
-            'block.*.attn.out', 'block.*.mlp.gate', 'block.*.attn.qkv',
-            'embedding', 'unembedding'
-        ]
+        def make_experts_quant_config(experts_layout: str) -> QuantConfig:
+            experts_quant_config = QuantConfig()
+            if experts_layout == "mxfp4":
+                experts_quant_config.quant_algo = ModelConfig.get_mxfp4_quant_algo(
+                    moe_backend)
+                experts_quant_config.group_size = 32
+            else:
+                experts_quant_config.quant_algo = QuantAlgo.NVFP4
+                experts_quant_config.group_size = 16
+            experts_quant_config.exclude_modules = [
+                'block.*.attn.out', 'block.*.mlp.gate',
+                'block.*.attn.qkv', 'embedding', 'unembedding'
+            ]
+            return experts_quant_config
+
+        experts_quant_config = make_experts_quant_config(layout)
 
         if layer_quant_config is None:
             layer_quant_config = {}
         else:
             layer_quant_config = dict(layer_quant_config)
 
-        num_moe_layers = pretrained_config.num_hidden_layers
-        if (spec_config is not None
-                and spec_config.spec_dec_mode.is_mtp_one_model()):
-            num_moe_layers += spec_config.num_nextn_predict_layers
-
-        for layer_idx in range(num_moe_layers):
+        for layer_idx in range(pretrained_config.num_hidden_layers):
             layer_quant_config[
                 f"model.layers.{layer_idx}.mlp.experts"] = experts_quant_config
+
+        if (spec_config is not None
+                and spec_config.spec_dec_mode.is_mtp_one_model()):
+            num_checkpoint_mtp_layers = max(
+                getattr(pretrained_config, "num_nextn_predict_layers", 1), 1)
+            for mtp_idx in range(spec_config.num_nextn_predict_layers):
+                checkpoint_mtp_idx = mtp_idx % num_checkpoint_mtp_layers
+                mtp_weight = (
+                    f"mtp.{checkpoint_mtp_idx}.ffn.experts.0.w1.weight")
+                mtp_info = ModelConfig._get_safetensors_header_for_tensor(
+                    checkpoint_dir, mtp_weight)
+                mtp_layout = None
+                if mtp_info is not None:
+                    if mtp_info.get("dtype") == "I8":
+                        mtp_layout = "mxfp4"
+                    elif mtp_info.get("dtype") == "U8":
+                        mtp_layout = "nvfp4"
+                mtp_quant_config = (
+                    make_experts_quant_config(mtp_layout)
+                    if mtp_layout is not None else experts_quant_config)
+                layer_idx = pretrained_config.num_hidden_layers + mtp_idx
+                layer_quant_config[
+                    f"model.layers.{layer_idx}.mlp.experts"] = mtp_quant_config
 
         logger.info(
             "Detected DeepSeek-V4 routed MoE %s checkpoint layout; using "
@@ -1132,6 +1189,10 @@ class ModelConfig(Generic[TConfig]):
         elif quant_config_file := cached_file(checkpoint_dir, 'dtypes.json'):
             quant_config, layer_quant_config = cls.load_quant_config_from_dtypes_json(
                 quant_config_file, moe_backend_hint)
+
+        if architecture in _DEEPSEEK_V4_ARCHITECTURES:
+            quant_config = cls._resolve_deepseek_v4_mixed_quant_config(
+                checkpoint_dir, quant_config)
 
         kwargs['moe_backend'] = cls.resolve_moe_backend(
             requested_moe_backend,

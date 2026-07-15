@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # --------------------------------------------------
 # Portions of this code were derived from DeepSeek‑V3:
 #   https://github.com/deepseek-ai/DeepSeek-V3
@@ -91,6 +94,17 @@ from ..utils import (
 )
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, EagerFusionConfig, filter_weights, register_auto_model
+
+
+def _unquantized_quant_config(quant_config: Optional[QuantConfig]) -> QuantConfig:
+    """Return a concrete unquantized config while preserving KV-cache quantization."""
+    return QuantConfig(
+        quant_algo=None,
+        kv_cache_quant_algo=(
+            quant_config.kv_cache_quant_algo if quant_config is not None else None
+        ),
+        group_size=None,
+    )
 
 
 @triton.jit
@@ -1519,10 +1533,22 @@ class DeepseekV4MoE(nn.Module):
 
         self.mapping = model_config.mapping
 
-        # FIXME: incompatible with mixed quantization mode (including excluding modules from quantization)
+        shared_quant_config = self._get_shared_experts_quant_config(model_config, layer_idx)
+        shared_model_config = model_config
+        if shared_quant_config is not model_config.quant_config:
+            shared_model_config = copy.copy(model_config)
+            shared_model_config.quant_config = shared_quant_config
+
+        # The shared experts can have a different quantization from the routed
+        # experts. Only a concrete shared-expert algorithm constrains TP by its
+        # quantization block size.
         block_size = 1
-        if model_config.quant_config and model_config.quant_config.group_size is not None:
-            block_size = model_config.quant_config.group_size
+        if (
+            shared_quant_config is not None
+            and shared_quant_config.quant_algo is not None
+            and shared_quant_config.group_size is not None
+        ):
+            block_size = shared_quant_config.group_size
 
         shared_tp_size, self.shared_output_scale = self._compute_shared_expert_tp_size(
             shared_expert_intermediate_size, block_size
@@ -1533,7 +1559,7 @@ class DeepseekV4MoE(nn.Module):
             intermediate_size=shared_expert_intermediate_size,
             bias=False,
             dtype=dtype,
-            config=model_config,
+            config=shared_model_config,
             overridden_tp_size=shared_tp_size,
             reduce_output=False,
             swiglu_limit=swiglu_limit,
@@ -1595,12 +1621,47 @@ class DeepseekV4MoE(nn.Module):
         return shared_tp_size, shared_output_scale
 
     @staticmethod
-    def _get_experts_quant_config(model_config, layer_idx: int) -> QuantConfig:
-        if getattr(model_config, "quant_config_dict", None) is None:
-            return model_config.quant_config
-        return model_config.quant_config_dict.get(
-            f"model.layers.{layer_idx}.mlp.experts", model_config.quant_config
-        )
+    def _get_experts_quant_config(model_config, layer_idx: int) -> Optional[QuantConfig]:
+        quant_config = model_config.quant_config
+        quant_config_dict = getattr(model_config, "quant_config_dict", None)
+        if quant_config_dict is not None:
+            experts_quant_config = quant_config_dict.get(f"model.layers.{layer_idx}.mlp.experts")
+            if experts_quant_config is not None:
+                return experts_quant_config
+
+        if quant_config is not None and quant_config.quant_algo is QuantAlgo.MIXED_PRECISION:
+            raise ValueError(
+                f"Missing concrete routed-expert quant config for DeepSeek-V4 layer {layer_idx}"
+            )
+        return quant_config
+
+    @staticmethod
+    def _get_shared_experts_quant_config(model_config, layer_idx: int) -> Optional[QuantConfig]:
+        quant_config = model_config.quant_config
+        quant_config_dict = getattr(model_config, "quant_config_dict", None)
+        if quant_config_dict is not None:
+            base_name = f"model.layers.{layer_idx}.mlp.shared_experts"
+            shared_quant_config = quant_config_dict.get(base_name)
+            if shared_quant_config is not None:
+                return shared_quant_config
+            for name, shared_quant_config in quant_config_dict.items():
+                if name.startswith(base_name + "."):
+                    return shared_quant_config
+
+        if quant_config is None:
+            return quant_config
+        if quant_config.quant_algo is QuantAlgo.MIXED_PRECISION:
+            raise ValueError(
+                "DeepSeek-V4 MIXED_PRECISION default was not resolved to a concrete algorithm"
+            )
+
+        candidates = [
+            f"model.layers.{layer_idx}.mlp.shared_experts",
+            f"layers.{layer_idx}.ffn.shared_experts",
+        ]
+        if any(quant_config.is_module_excluded_from_quantization(name) for name in candidates):
+            return _unquantized_quant_config(quant_config)
+        return quant_config
 
     def compute_routed_output(
         self, hidden_states, hidden_states_fp4, input_ids, all_rank_num_tokens, do_finalize
@@ -1724,6 +1785,13 @@ class DeepseekV4DecoderLayer(DecoderLayer):
         self.mlp_tp_size = mapping.tp_size
         self.is_p2p_supported = can_access_peer(mapping)
 
+        quant_config = self._get_decoder_layer_quant_config(model_config, layer_idx)
+        decoder_model_config = model_config
+        if quant_config is not model_config.quant_config:
+            decoder_model_config = copy.copy(model_config)
+            decoder_model_config.quant_config = quant_config
+        self.is_nvfp4 = quant_config.layer_quant_mode.has_nvfp4()
+
         self.hc_attn = mHC(
             config.hc_mult,
             config.hidden_size,
@@ -1738,7 +1806,7 @@ class DeepseekV4DecoderLayer(DecoderLayer):
             layer_idx_for_attention = layer_idx - model_config.pretrained_config.num_hidden_layers
 
         self.self_attn = DeepseekV4Attention(
-            model_config,
+            decoder_model_config,
             layer_idx=layer_idx_for_attention,
             aux_stream=aux_stream_dict[AuxStreamType.Attention],
             reduce_output=not self.enable_attention_dp and self.mapping.tp_size > 1,
@@ -1754,13 +1822,6 @@ class DeepseekV4DecoderLayer(DecoderLayer):
             config.hc_sinkhorn_iters,
             dtype=torch.float32,
             post_mult_value=2.0,
-        )
-
-        # FIXME: incompatible with mixed quantization mode
-        quant_config = self._get_decoder_layer_quant_config(model_config, layer_idx)
-        self.is_nvfp4 = quant_config.layer_quant_mode.has_nvfp4()
-        assert quant_config.quant_algo is not QuantAlgo.MIXED_PRECISION, (
-            "MIXED_PRECISION is ambiguous"
         )
 
         self.allreduce = None
@@ -1843,24 +1904,30 @@ class DeepseekV4DecoderLayer(DecoderLayer):
                 stream=aux_stream_dict[AuxStreamType.EngramPrecompute],
             )
 
+    @staticmethod
     def _get_decoder_layer_quant_config(
-        self, model_config: ModelConfig[PretrainedConfig], layer_idx: int
-    ):
-        """
-        The MTP layer in the nvfp4 checkpoint is unquantized. Because the TRTLLM
-        moe_backend only supports fp8/fp4 quantization, we need to override
-        the quant_config for the MTP layer.
+        model_config: ModelConfig[PretrainedConfig], layer_idx: int
+    ) -> QuantConfig:
+        """Resolve the concrete default quantization for one decoder layer.
+
+        A global MIXED_PRECISION config is only a container for per-module
+        configs and cannot be applied to the decoder as an algorithm. The
+        model-config loader must resolve the checkpoint's concrete default
+        algorithm before constructing decoder modules.
         """
         quant_config = model_config.quant_config
+        if quant_config is None:
+            return _unquantized_quant_config(quant_config)
+
+        if quant_config.quant_algo is QuantAlgo.MIXED_PRECISION:
+            raise ValueError(
+                "DeepSeek-V4 MIXED_PRECISION default was not resolved to a concrete algorithm"
+            )
 
         layer_name = f"model.layers.{layer_idx}"
         if quant_config.is_module_excluded_from_quantization(layer_name):
-            return QuantConfig(
-                quant_algo=None,
-                kv_cache_quant_algo=quant_config.kv_cache_quant_algo,
-            )
-        else:
-            return model_config.quant_config
+            return _unquantized_quant_config(quant_config)
+        return quant_config
 
     def _compute_mlp_tp_size(self, intermediate_size: int, block_size: int) -> int:
         """
@@ -2158,6 +2225,7 @@ class DeepseekV4MTP(DeepseekV4DecoderLayer):
         self.num_experts = config.n_routed_experts
         self.num_shared_experts = config.n_shared_experts
         self.top_k = config.num_experts_per_tok
+        mtp_quant_config = self._get_decoder_layer_quant_config(model_config, layer_idx)
 
         self.aux_stream = aux_stream_dict[AuxStreamType.MoeShared]
         self.event_dict = {key: torch.cuda.Event() for key in [EventType.Main, EventType.MoeShared]}
@@ -2176,7 +2244,7 @@ class DeepseekV4MTP(DeepseekV4DecoderLayer):
                 config.hidden_size,
                 bias=False,
                 dtype=config.torch_dtype,
-                quant_config=model_config.get_quant_config(),
+                quant_config=mtp_quant_config,
                 skip_create_weights_in_init=model_config.skip_create_weights_in_init,
             )
             self.h_proj = Linear(
@@ -2184,7 +2252,7 @@ class DeepseekV4MTP(DeepseekV4DecoderLayer):
                 config.hidden_size,
                 bias=False,
                 dtype=config.torch_dtype,
-                quant_config=model_config.get_quant_config(),
+                quant_config=mtp_quant_config,
                 skip_create_weights_in_init=model_config.skip_create_weights_in_init,
             )
         else:
@@ -2196,7 +2264,7 @@ class DeepseekV4MTP(DeepseekV4DecoderLayer):
                 tensor_parallel_mode=TensorParallelMode.ROW,
                 mapping=model_config.mapping,
                 reduce_output=True,
-                quant_config=model_config.get_quant_config(),
+                quant_config=mtp_quant_config,
                 skip_create_weights_in_init=model_config.skip_create_weights_in_init,
             )
             self.h_proj = Linear(
@@ -2207,7 +2275,7 @@ class DeepseekV4MTP(DeepseekV4DecoderLayer):
                 tensor_parallel_mode=TensorParallelMode.ROW,
                 mapping=model_config.mapping,
                 reduce_output=True,
-                quant_config=model_config.get_quant_config(),
+                quant_config=mtp_quant_config,
                 skip_create_weights_in_init=model_config.skip_create_weights_in_init,
             )
 
